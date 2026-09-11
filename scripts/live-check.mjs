@@ -4,7 +4,15 @@
  * This is deliberately a script rather than a unit test: it creates and
  * destroys a real sprite, so it must never run in an unattended test suite.
  *
- *   SPRITES_TOKEN=... node scripts/live-check.mjs
+ *   node scripts/live-check.mjs
+ *
+ * The token is resolved without ever being typed on a command line (which
+ * would leave it in shell history and in the process table). In order:
+ *
+ *   1. $SPRITES_TOKEN, if already exported.
+ *   2. `pass show $SPRITES_TOKEN_PASS_PATH` (default
+ *      cjndubisi/sprites/api-token), so the credential stays encrypted at rest
+ *      in the password store.
  *
  * It exercises the provider's actual handlers end to end: acquire a lease,
  * realize a workspace, sync files in, execute a command, sync files back, then
@@ -14,15 +22,52 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import sealed from "../dist/plugin.js";
 
 // `definePlugin` returns a sealed object; the host calls handlers through
 // `.definition`. The live check drives the same surface the host does.
 const plugin = sealed.definition;
 
-const token = process.env.SPRITES_TOKEN?.trim();
+/**
+ * Resolve the API token from the environment, falling back to the `pass`
+ * password store.
+ *
+ * Reading from `pass` keeps the credential encrypted at rest and out of shell
+ * history. `execFileSync` passes the path as an argv element rather than
+ * through a shell, so a path containing shell metacharacters cannot be
+ * interpreted as a command.
+ */
+function resolveToken() {
+  const fromEnv = process.env.SPRITES_TOKEN?.trim();
+  if (fromEnv) return fromEnv;
+
+  const passPath = process.env.SPRITES_TOKEN_PASS_PATH?.trim() || "cjndubisi/sprites/api-token";
+  try {
+    const value = execFileSync("pass", ["show", passPath], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return value.split("\n")[0]?.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+const token = resolveToken();
 if (!token) {
-  console.error("Set SPRITES_TOKEN to run the live check.");
+  console.error(
+    [
+      "No Sprites API token found.",
+      "",
+      "Store one in pass (preferred — stays encrypted at rest):",
+      "  sprite login          # prints a token on first authentication",
+      "  pass insert -m cjndubisi/sprites/api-token",
+      "",
+      "Or export it for this shell:",
+      "  export SPRITES_TOKEN=\"org-slug/org-id/token-id/token-value\"",
+    ].join("\n"),
+  );
   process.exit(1);
 }
 

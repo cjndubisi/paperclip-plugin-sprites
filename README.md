@@ -137,6 +137,39 @@ runtime, in this order:
 2. The `SPRITES_TOKEN` environment variable on the Paperclip host. This is the
    single-tenant convenience path and matches the Sprites CLI.
 
+### Getting a token
+
+A Sprites token is **not** a `flyctl` token. They are different credentials for
+different APIs — a `fm2_…` macaroon from `fly auth token` is rejected by
+`api.sprites.dev`. A Sprites token has the form
+`org-slug/org-id/token-id/token-value`.
+
+Your Fly.io account is the *authority* that mints one; the token is the
+*credential* the plugin uses. Get one either way:
+
+```bash
+sprite login        # OAuth via the browser; prints a token on first auth
+# or create one in the dashboard at sprites.dev
+```
+
+### Storing it in `pass`
+
+`scripts/live-check.mjs` reads the token from the [`pass`](https://passwordstore.org)
+password store when `SPRITES_TOKEN` is not exported, so the credential stays
+encrypted at rest and never enters shell history:
+
+```bash
+pass insert -m cjndubisi/sprites/api-token   # paste the token, Ctrl-D
+node scripts/live-check.mjs                  # no env var needed
+```
+
+Override the entry path with `SPRITES_TOKEN_PASS_PATH`. Prefer this to
+`export SPRITES_TOKEN=…` on a command line: an exported secret is visible in
+shell history and, briefly, in the process table.
+
+For a headless host, `sprite auth setup --token "$(pass show …)"` configures the
+CLI without a browser.
+
 Copy `.env.example` to `.env` for local work; `.env` is gitignored.
 
 Never place model-gateway or provider credentials in argv, agent-visible
