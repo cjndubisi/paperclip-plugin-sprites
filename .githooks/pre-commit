@@ -1,0 +1,52 @@
+#!/usr/bin/env sh
+#
+# Refuse a commit that contains something shaped like a credential.
+#
+# Install once:
+#   git config core.hooksPath .githooks
+#
+# This is a speed bump, not a guarantee. A leaked credential is only truly
+# remediated by ROTATING it: rewriting history does not remove objects that
+# have already been pushed, and anything that was public must be assumed
+# scraped.
+
+set -e
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$staged" ] && exit 0
+
+fail=0
+
+for file in $staged; do
+  case "$file" in
+    .env.example|.githooks/*|*.md) continue ;;
+  esac
+  [ -f "$file" ] || continue
+
+  # A Sprites token is org/id/id/secret with long hex tails.
+  if grep -qE '[A-Za-z0-9-]+/[0-9]+/[a-f0-9]{16,}/[a-f0-9]{16,}' "$file"; then
+    echo "Refusing commit: possible Sprites API token in $file"
+    fail=1
+  fi
+
+  # A bare long hex run is almost never legitimate source.
+  if grep -qE '[a-f0-9]{64,}' "$file"; then
+    echo "Refusing commit: possible secret (64+ hex chars) in $file"
+    fail=1
+  fi
+
+  # An assignment with a long literal on the right-hand side.
+  if grep -qE '(SPRITES_TOKEN|api[_-]?key|secret|password)[[:space:]]*[=:][[:space:]]*["'"'"'][^"'"'"']{16,}' "$file"; then
+    echo "Refusing commit: hardcoded credential assignment in $file"
+    fail=1
+  fi
+done
+
+if [ "$fail" -ne 0 ]; then
+  echo ""
+  echo "Read a token from the environment instead (see .env.example)."
+  echo "If this is a false positive: git commit --no-verify"
+  exit 1
+fi
+
+exit 0

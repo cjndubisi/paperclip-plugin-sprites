@@ -1,0 +1,45 @@
+{
+  "name": "@cjndubisi/paperclip-plugin-sprites",
+  "version": "0.1.0",
+  "description": "Paperclip sandbox provider plugin that provisions Fly.io Sprites as agent execution environments.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/worker.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@paperclipai/plugin-sdk": "2026.831.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0",
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cjndubisi/paperclip-plugin-sprites.git"
+  },
+  "homepage": "https://github.com/cjndubisi/paperclip-plugin-sprites#readme",
+  "bugs": {
+    "url": "https://github.com/cjndubisi/paperclip-plugin-sprites/issues"
+  },
+  "keywords": [
+    "paperclip",
+    "paperclip-plugin",
+    "sandbox-provider",
+    "fly.io",
+    "sprites",
+    "agents",
+    "firecracker"
+  ]
+}
