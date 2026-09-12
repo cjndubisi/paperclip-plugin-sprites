@@ -23,7 +23,7 @@ import type {
   PluginSyncOperation,
 } from "@paperclipai/plugin-sdk";
 
-import type { SpritesClient } from "./sprites-client.js";
+import { shellQuote, type SpritesClient } from "./sprites-client.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -35,10 +35,6 @@ interface SyncInput {
   spriteName: string;
   operations: PluginSyncOperation[];
   timeoutMs: number;
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 /**
