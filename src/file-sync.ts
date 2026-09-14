@@ -127,28 +127,53 @@ async function countFilesAndBytes(target: string): Promise<{ files: number; byte
 }
 
 /**
- * Honour the source tree's own VCS ignore rules during a directory transfer.
+ * Let git decide which files a repository checkout actually contains.
  *
- * A repository checkout already declares what is disposable — `node_modules`,
- * build output, caches — in `.gitignore`. Archiving it anyway transfers
- * hundreds of megabytes of regenerable bytes: measured on one agent worktree,
- * a full archive was 1429 MB in 66s versus 57 MB in 1.5s with ignores applied,
- * which is the difference between finishing inside the host's RPC budget and
- * being killed mid-transfer.
+ * A workspace sync moves a checkout, and most of a checkout's bytes are
+ * regenerable: on one agent worktree a naive archive was 1429 MB built in 66s,
+ * versus 57 MB once ignored files were left behind. The host caps a sync RPC,
+ * so those wasted bytes are the difference between completing and being killed
+ * mid-transfer.
  *
- * GNU tar reads `.gitignore` for this flag and still archives `.git` itself, so
- * commits made inside the sandbox survive the trip back. Both sides of this
- * transfer run GNU tar; the flag is skipped when the mapping opts out so a
- * caller that genuinely needs ignored files can still ask for them.
+ * `tar --exclude-vcs-ignores` looks like the fix and is not. It re-implements
+ * pattern matching without git's index, so it diverges from git in both
+ * directions — verified against GNU tar 1.35:
+ *
+ * - a NEGATED pattern (`!keep.log`) is dropped, though git keeps the file;
+ * - a TRACKED file matching an ignore pattern (`git add -f secrets.txt`) is
+ *   dropped, though git keeps it — silent loss of committed content;
+ * - `.git/info/exclude` is not consulted, so files git ignores are archived.
+ *
+ * Losing a tracked file on the way out of the sandbox destroys an agent's work,
+ * so the enumeration has to come from git itself. `git ls-files --cached
+ * --others --exclude-standard` lists exactly tracked + untracked-not-ignored
+ * files, applying the full ignore chain (`.gitignore` at every level, global
+ * excludes, `.git/info/exclude`) and letting the index win where it should.
+ *
+ * `.git` is appended explicitly because `ls-files` never lists it, and a
+ * transfer that drops it loses every commit the agent made inside the sandbox.
  */
-const VCS_IGNORE_ARG = "--exclude-vcs-ignores";
+const GIT_LIST_ARGS = ["ls-files", "--cached", "--others", "--exclude-standard", "-z"] as const;
 
-export function tarExcludeArgs(
-  exclude: string[] | undefined,
-  respectVcsIgnores: boolean,
-): string[] {
-  const args = (exclude ?? []).flatMap((pattern) => ["--exclude", pattern]);
-  return respectVcsIgnores ? [VCS_IGNORE_ARG, ...args] : args;
+export function tarExcludeArgs(exclude: string[] | undefined): string[] {
+  return (exclude ?? []).flatMap((pattern) => ["--exclude", pattern]);
+}
+
+/**
+ * Ask git for the tree's content list, NUL-delimited, or null when the path is
+ * not a git checkout (`ls-files` exits 128). A non-repo directory has no ignore
+ * rules to honour, so those callers fall back to archiving the whole tree.
+ */
+export async function gitContentList(rootPath: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync("git", ["-C", rootPath, ...GIT_LIST_ARGS], {
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    // Entries are NUL-terminated; append `.git` so history travels with them.
+    return `${stdout}.git\0`;
+  } catch {
+    return null;
+  }
 }
 
 /** Transfer one mapping from the host into the sprite. */
@@ -190,14 +215,32 @@ async function syncMappingIn(
   const remoteArchive = path.posix.join(REMOTE_STAGING_ROOT, archiveName);
 
   try {
-    await execFileAsync("tar", [
-      "-cf",
-      hostArchive,
-      ...tarExcludeArgs(mapping.exclude, respectVcsIgnores),
-      "-C",
-      mapping.sourcePath,
-      ".",
-    ]);
+    // A checkout enumerates itself through git, so ignored build output never
+    // crosses the wire. Anything else is archived whole.
+    const contentList = respectVcsIgnores ? await gitContentList(mapping.sourcePath) : null;
+    if (contentList) {
+      const listPath = path.join(hostStaging, "content.list");
+      await fs.writeFile(listPath, contentList);
+      await execFileAsync("tar", [
+        "-cf",
+        hostArchive,
+        "-C",
+        mapping.sourcePath,
+        ...tarExcludeArgs(mapping.exclude),
+        "--null",
+        "-T",
+        listPath,
+      ]);
+    } else {
+      await execFileAsync("tar", [
+        "-cf",
+        hostArchive,
+        ...tarExcludeArgs(mapping.exclude),
+        "-C",
+        mapping.sourcePath,
+        ".",
+      ]);
+    }
 
     const archive = await fs.readFile(hostArchive);
     await client.writeFile(spriteName, remoteArchive, archive, timeoutMs);
@@ -248,16 +291,32 @@ async function syncMappingOut(
   const hostArchive = path.join(hostStaging, archiveName);
 
   try {
-    const excludeArgs = [
-      ...(respectVcsIgnores ? [VCS_IGNORE_ARG] : []),
-      ...(mapping.exclude ?? []).map((pattern) => `--exclude ${shellQuote(pattern)}`),
-    ].join(" ");
+    const excludeArgs = (mapping.exclude ?? [])
+      .map((pattern) => `--exclude ${shellQuote(pattern)}`)
+      .join(" ");
+
+    // Enumerate inside the sandbox with git when the source is a checkout, so
+    // the agent's tracked and new files all travel and ignored build output
+    // does not. `git ls-files` exits non-zero outside a repo, so the `||`
+    // branch archives the tree whole — the same fallback the host leg uses.
+    const source = shellQuote(mapping.sourcePath);
+    const listFile = `${shellQuote(remoteArchive)}.list`;
+    const archiveCommand = respectVcsIgnores
+      ? `mkdir -p ${shellQuote(REMOTE_STAGING_ROOT)} && ` +
+        `if git -C ${source} ls-files --cached --others --exclude-standard -z > ${listFile} 2>/dev/null; then ` +
+        `printf '.git\\0' >> ${listFile}; ` +
+        `tar -cf ${shellQuote(remoteArchive)} -C ${source} ${excludeArgs} --null -T ${listFile}; ` +
+        `rc=$?; rm -f ${listFile}; exit $rc; ` +
+        `else rm -f ${listFile}; ` +
+        `tar -cf ${shellQuote(remoteArchive)} ${excludeArgs} -C ${source} .; fi`
+      : `mkdir -p ${shellQuote(REMOTE_STAGING_ROOT)} && ` +
+        `tar -cf ${shellQuote(remoteArchive)} ${excludeArgs} -C ${source} .`;
 
     const archiveResult = await client.exec(spriteName, {
       cmd: [
         "sh",
         "-c",
-        `mkdir -p ${shellQuote(REMOTE_STAGING_ROOT)} && tar -cf ${shellQuote(remoteArchive)} ${excludeArgs} -C ${shellQuote(mapping.sourcePath)} .`,
+        archiveCommand,
       ],
       timeoutMs,
     });

@@ -5,7 +5,12 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { assertArchiveMembersAreSafe, isContainedWithin, tarExcludeArgs } from "./file-sync.js";
+import {
+  assertArchiveMembersAreSafe,
+  gitContentList,
+  isContainedWithin,
+  tarExcludeArgs,
+} from "./file-sync.js";
 
 const execFileAsync = promisify(execFile);
 const tempDirs: string[] = [];
@@ -21,6 +26,43 @@ afterEach(async () => {
     tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })),
   );
 });
+
+/**
+ * A checkout exercising every ignore rule that distinguishes git's answer from
+ * tar's: a negation, a force-added file matching an ignore pattern, an ignored
+ * directory, a nested .gitignore, and .git/info/exclude.
+ */
+async function makeGitRepo(): Promise<string> {
+  const repo = await makeTempDir();
+  const git = (...args: string[]) => execFileAsync("git", ["-C", repo, ...args]);
+  const write = async (relative: string, contents: string) => {
+    await fs.mkdir(path.dirname(path.join(repo, relative)), { recursive: true });
+    await fs.writeFile(path.join(repo, relative), contents);
+  };
+
+  await git("init", "-q");
+  await git("config", "user.email", "test@example.com");
+  await git("config", "user.name", "Test");
+
+  await write(".gitignore", "*.log\n!keep.log\nbuild/\nsecrets.txt\nnode_modules\n");
+  await write("app.ts", "export const x = 1;\n");
+  await write("debug.log", "ignored\n");
+  await write("keep.log", "negated\n");
+  await write("secrets.txt", "tracked despite the pattern\n");
+  await write("build/out.js", "artifact\n");
+  await write("node_modules/pkg/index.js", "dependency\n");
+
+  await git("add", "-A");
+  await git("add", "-f", "secrets.txt");
+  await git("commit", "-qm", "initial");
+
+  await fs.appendFile(path.join(repo, ".git/info/exclude"), "excluded-by-info.txt\n");
+  await write("excluded-by-info.txt", "ignored via info/exclude\n");
+  // Uncommitted output, exactly what an agent produces mid-run.
+  await write("NEW-WORK.md", "agent output\n");
+
+  return repo;
+}
 
 describe("isContainedWithin", () => {
   it("accepts a direct child", () => {
@@ -123,69 +165,56 @@ describe("assertArchiveMembersAreSafe", () => {
 });
 
 describe("tarExcludeArgs", () => {
-  it("honours VCS ignore rules by default", () => {
-    expect(tarExcludeArgs(undefined, true)).toEqual(["--exclude-vcs-ignores"]);
-  });
-
-  it("omits the VCS flag when the caller opts out", () => {
-    expect(tarExcludeArgs(undefined, false)).toEqual([]);
-  });
-
-  it("keeps explicit patterns alongside the VCS flag", () => {
-    expect(tarExcludeArgs([".venv"], true)).toEqual([
-      "--exclude-vcs-ignores",
+  it("maps explicit patterns to tar --exclude flags", () => {
+    expect(tarExcludeArgs([".venv", "*.tmp"])).toEqual([
       "--exclude",
       ".venv",
+      "--exclude",
+      "*.tmp",
     ]);
+  });
+
+  it("returns nothing when no patterns are given", () => {
+    expect(tarExcludeArgs(undefined)).toEqual([]);
   });
 });
 
-describe("--exclude-vcs-ignores against a real checkout", () => {
-  // The flag is GNU tar only. Both transfer legs in production run GNU tar
-  // (the Paperclip host image and the Ubuntu sprite), but macOS ships bsdtar,
-  // so this behavioural test is skipped there rather than asserting a flag the
-  // local tar cannot honour.
-  it("drops gitignored build output but keeps .git and tracked sources", async () => {
-    const { stdout: tarHelp } = await execFileAsync("tar", ["--help"]).catch(() => ({ stdout: "" }));
-    if (!tarHelp.includes("exclude-vcs-ignores")) {
-      console.warn("skipping: local tar is not GNU tar (production uses GNU tar on both legs)");
-      return;
-    }
+describe("gitContentList", () => {
+  it("returns null outside a git checkout so the caller archives everything", async () => {
+    const plain = await makeTempDir();
+    await fs.writeFile(path.join(plain, "notes.txt"), "no git here\n");
+    expect(await gitContentList(plain)).toBeNull();
+  });
 
-    const repo = await makeTempDir();
-    await fs.writeFile(path.join(repo, ".gitignore"), "node_modules\ndist\n");
-    await fs.writeFile(path.join(repo, "index.ts"), "export const x = 1;\n");
-    await fs.mkdir(path.join(repo, "node_modules/big"), { recursive: true });
-    await fs.writeFile(path.join(repo, "node_modules/big/blob.bin"), "x".repeat(200_000));
-    await fs.mkdir(path.join(repo, "dist"), { recursive: true });
-    await fs.writeFile(path.join(repo, "dist/index.js"), "compiled\n");
+  it("matches git's own content list and always includes .git", async () => {
+    const repo = await makeGitRepo();
+    const list = await gitContentList(repo);
+    expect(list).not.toBeNull();
+    const entries = list!.split("\0").filter(Boolean);
 
-    // A real git repo: --exclude-vcs-ignores reads the checkout's ignore rules.
-    const git = (...args: string[]) => execFileAsync("git", ["-C", repo, ...args]);
-    await git("init", "-q");
-    await git("config", "user.email", "test@example.com");
-    await git("config", "user.name", "Test");
-    await git("add", "-A");
-    await git("commit", "-qm", "initial");
+    // git's definition of content: tracked + untracked-not-ignored.
+    expect(entries).toContain("app.ts");
+    expect(entries).toContain("NEW-WORK.md");
+    // History must travel or sandbox commits are lost.
+    expect(entries).toContain(".git");
+    // Ignored, regenerable output stays behind.
+    expect(entries.some((e) => e.startsWith("node_modules/"))).toBe(false);
+    expect(entries.some((e) => e.startsWith("build/"))).toBe(false);
+  });
 
-    const archive = path.join(await makeTempDir(), "out.tar");
-    await execFileAsync("tar", [
-      "-cf",
-      archive,
-      ...tarExcludeArgs(undefined, true),
-      "-C",
-      repo,
-      ".",
-    ]);
+  it("keeps files tar --exclude-vcs-ignores would wrongly drop", async () => {
+    // These two cases are why enumeration comes from git rather than tar:
+    // tar re-implements pattern matching without the index and drops both,
+    // which would silently destroy committed work on the way out of a sandbox.
+    const repo = await makeGitRepo();
+    const entries = (await gitContentList(repo))!.split("\0").filter(Boolean);
+    expect(entries).toContain("keep.log"); // negated by "!keep.log"
+    expect(entries).toContain("secrets.txt"); // tracked via `git add -f`
+  });
 
-    const { stdout } = await execFileAsync("tar", ["-tf", archive]);
-    const members = stdout.split("\n").filter(Boolean);
-
-    // Ignored, regenerable bytes stay behind.
-    expect(members.some((m) => m.includes("node_modules/"))).toBe(false);
-    expect(members.some((m) => m.includes("dist/"))).toBe(false);
-    // Sources and git history must survive, or a sandbox commit would be lost.
-    expect(members.some((m) => m.endsWith("index.ts"))).toBe(true);
-    expect(members.some((m) => m.startsWith("./.git"))).toBe(true);
+  it("honours .git/info/exclude, which tar does not consult", async () => {
+    const repo = await makeGitRepo();
+    const entries = (await gitContentList(repo))!.split("\0").filter(Boolean);
+    expect(entries).not.toContain("excluded-by-info.txt");
   });
 });
