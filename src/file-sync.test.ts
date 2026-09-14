@@ -5,7 +5,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { assertArchiveMembersAreSafe, isContainedWithin } from "./file-sync.js";
+import { assertArchiveMembersAreSafe, isContainedWithin, tarExcludeArgs } from "./file-sync.js";
 
 const execFileAsync = promisify(execFile);
 const tempDirs: string[] = [];
@@ -119,5 +119,73 @@ describe("assertArchiveMembersAreSafe", () => {
     await expect(assertArchiveMembersAreSafe(archive, destination)).rejects.toThrow(
       /absolute/i,
     );
+  });
+});
+
+describe("tarExcludeArgs", () => {
+  it("honours VCS ignore rules by default", () => {
+    expect(tarExcludeArgs(undefined, true)).toEqual(["--exclude-vcs-ignores"]);
+  });
+
+  it("omits the VCS flag when the caller opts out", () => {
+    expect(tarExcludeArgs(undefined, false)).toEqual([]);
+  });
+
+  it("keeps explicit patterns alongside the VCS flag", () => {
+    expect(tarExcludeArgs([".venv"], true)).toEqual([
+      "--exclude-vcs-ignores",
+      "--exclude",
+      ".venv",
+    ]);
+  });
+});
+
+describe("--exclude-vcs-ignores against a real checkout", () => {
+  // The flag is GNU tar only. Both transfer legs in production run GNU tar
+  // (the Paperclip host image and the Ubuntu sprite), but macOS ships bsdtar,
+  // so this behavioural test is skipped there rather than asserting a flag the
+  // local tar cannot honour.
+  it("drops gitignored build output but keeps .git and tracked sources", async () => {
+    const { stdout: tarHelp } = await execFileAsync("tar", ["--help"]).catch(() => ({ stdout: "" }));
+    if (!tarHelp.includes("exclude-vcs-ignores")) {
+      console.warn("skipping: local tar is not GNU tar (production uses GNU tar on both legs)");
+      return;
+    }
+
+    const repo = await makeTempDir();
+    await fs.writeFile(path.join(repo, ".gitignore"), "node_modules\ndist\n");
+    await fs.writeFile(path.join(repo, "index.ts"), "export const x = 1;\n");
+    await fs.mkdir(path.join(repo, "node_modules/big"), { recursive: true });
+    await fs.writeFile(path.join(repo, "node_modules/big/blob.bin"), "x".repeat(200_000));
+    await fs.mkdir(path.join(repo, "dist"), { recursive: true });
+    await fs.writeFile(path.join(repo, "dist/index.js"), "compiled\n");
+
+    // A real git repo: --exclude-vcs-ignores reads the checkout's ignore rules.
+    const git = (...args: string[]) => execFileAsync("git", ["-C", repo, ...args]);
+    await git("init", "-q");
+    await git("config", "user.email", "test@example.com");
+    await git("config", "user.name", "Test");
+    await git("add", "-A");
+    await git("commit", "-qm", "initial");
+
+    const archive = path.join(await makeTempDir(), "out.tar");
+    await execFileAsync("tar", [
+      "-cf",
+      archive,
+      ...tarExcludeArgs(undefined, true),
+      "-C",
+      repo,
+      ".",
+    ]);
+
+    const { stdout } = await execFileAsync("tar", ["-tf", archive]);
+    const members = stdout.split("\n").filter(Boolean);
+
+    // Ignored, regenerable bytes stay behind.
+    expect(members.some((m) => m.includes("node_modules/"))).toBe(false);
+    expect(members.some((m) => m.includes("dist/"))).toBe(false);
+    // Sources and git history must survive, or a sandbox commit would be lost.
+    expect(members.some((m) => m.endsWith("index.ts"))).toBe(true);
+    expect(members.some((m) => m.startsWith("./.git"))).toBe(true);
   });
 });
